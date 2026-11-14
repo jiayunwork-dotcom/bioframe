@@ -8,3 +8,11 @@ File I/O
    :members:
 
 .. autofunction:: bioframe.io.bed.to_bed
+
+Coordinate liftover (UCSC chain files)
+======================================
+
+.. automodule:: bioframe.io.liftover
+   :autosummary:
+   :members:
+   :exclude-members: Chain

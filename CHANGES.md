@@ -2,6 +2,14 @@
 
 ## [Upcoming release](https://github.com/open2c/bioframe/compare/v0.8.0...HEAD)
 
+API changes:
+
+- UCSC chain file support: `read_chain` parses local, gzip-compressed or
+  stream-provided chain files into a reusable `ChainMap`, and `liftover`
+  remaps interval dataframes from the chain target to the query coordinate
+  system with per-chain coverage thresholds, block-level fragment output and
+  explicit `no_overlap`/`low_coverage`/`ambiguous` unmapped reports.
+
 ## v0.8.0
 
 Date: 2025-04-08

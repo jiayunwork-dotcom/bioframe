@@ -13,21 +13,26 @@ from .fileops import (
     to_bigbed,
     to_bigwig,
 )
+from .liftover import Chain, ChainMap, liftover, read_chain
 from .resources import UCSCClient, fetch_centromeres, fetch_chromsizes
 from .schemas import SCHEMAS
 
 __all__ = [
     "SCHEMAS",
+    "Chain",
+    "ChainMap",
     "UCSCClient",
     "assemblies_available",
     "assembly_info",
     "fetch_centromeres",
     "fetch_chromsizes",
+    "liftover",
     "load_fasta",
     "read_alignments",
     "read_bam",
     "read_bigbed",
     "read_bigwig",
+    "read_chain",
     "read_chromsizes",
     "read_pairix",
     "read_tabix",
