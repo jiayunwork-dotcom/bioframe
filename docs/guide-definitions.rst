@@ -43,3 +43,9 @@ Associating genomic intervals with views
 Properties of sets of genomic intervals:
     - A set of genomic intervals may have overlaps or not. If it does not, it is said to be *overlap-free*.
     - A set of genomic intervals is *tiling* if it: (i) covers the associated view, (ii) is contained in that view, and (iii) is overlap-free. Equivalently, a tiling set of intervals (a) has an initial interval that begins at the start of each region and (b) a final interval that terminates at the end of each region, and (c) every base pair is associated with a unique interval.
+
+Numeric range and exactness:
+    - Coordinates are signed 64-bit integers: start and end may range from -2**63 to 2**63 - 1 (inclusive), stored as NumPy ``int64`` or pandas nullable ``Int64`` columns. Validation (``is_bedframe``) accepts exactly the intervals satisfying start <= end over this range.
+    - Interval relations (overlap, closest, cluster, merge) are computed exactly over the whole range: comparisons and candidate ordering never wrap around, saturate, or round coordinates to floating point.
+    - Quantities derived from coordinates are exact as well. Distances reported by ``closest`` are returned as ``Int64`` when every distance fits into signed int64, and as ``UInt64`` otherwise — a distance can exceed int64 only when the paired intervals span nearly the whole int64 range, and every such distance fits uint64. They are never truncated, saturated, or rounded to float.
+    - Points (start == end) follow the usual point semantics everywhere, including points at -2**63 and 2**63 - 1: a point at 2**63 - 1 overlaps itself and other coincident points, and is found by self-overlap queries.

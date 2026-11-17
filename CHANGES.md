@@ -10,6 +10,30 @@ API changes:
   system with per-chain coverage thresholds, block-level fragment output and
   explicit `no_overlap`/`low_coverage`/`ambiguous` unmapped reports.
 
+Bug fixes:
+
+- Interval operations are now exact over the full signed int64 coordinate
+  range [-2**63, 2**63 - 1]. Previously, intermediate int64 arithmetic could
+  overflow and silently change results: `is_bedframe` rejected legal long
+  intervals (and accepted start > end) when `end - start` wrapped around;
+  `closest` could pick a farther neighbor and misreport distances beyond
+  2**53 after an internal float64 cast, wrapped distances to small or
+  negative values across the full range, and corrupted large integer index
+  labels to float64 when any chromosome had no match; `merge`/`cluster`
+  with `min_dist` split intervals near INT64_MAX; `overlap` missed points
+  located exactly at INT64_MAX.
+- `closest` distances are exact integers: the `distance` column is `Int64`
+  when all distances fit signed int64 and `UInt64` otherwise (any distance
+  between valid intervals fits uint64). Distances are never truncated,
+  saturated, or rounded to float.
+- `closest(tie_breaking_col=...)` no longer raises "all keys need to be the
+  same shape" and resolves ties deterministically: by the tie-breaking
+  values and then by the lower row position in df2, as documented.
+- `overlap` and `closest` with an empty df2 now return all-missing matches
+  instead of raising `IndexError`.
+- `coverage` and `count_overlaps` no longer reset the index of the input
+  dataframe in place.
+
 ## v0.8.0
 
 Date: 2025-04-08

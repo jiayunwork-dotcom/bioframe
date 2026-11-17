@@ -239,6 +239,47 @@ def _minus(inds1, inds2, n1, n2, how):
     return inds1_unpaired, inds2_unpaired
 
 
+def _take_index_labels(index, positions):
+    """
+    Take labels from ``index`` at integer ``positions``. Positions of -1
+    (unpaired rows) yield a placeholder label that the caller must mask.
+    Unlike direct fancy indexing, this is safe for empty indexes and never
+    wraps around to a valid label.
+    """
+    positions = np.asarray(positions)
+    if len(index) == 0:
+        return pd.array([pd.NA] * len(positions), dtype=pd.Int64Dtype())
+    return index[np.where(positions < 0, 0, positions)]
+
+
+def _take_rows(df, positions):
+    """
+    Take rows of ``df`` at integer ``positions``. Positions of -1 (unpaired
+    rows) yield a placeholder row that the caller must mask. Unlike direct
+    ``.iloc`` fancy indexing, this is safe for empty dataframes and never
+    wraps around to a valid row.
+    """
+    positions = np.asarray(positions)
+    if len(df) == 0:
+        return pd.DataFrame(pd.NA, index=np.arange(len(positions)), columns=df.columns)
+    return df.iloc[np.where(positions < 0, 0, positions)]
+
+
+def _take_coords_int64(values, positions):
+    """
+    Take int64 coordinate values at integer ``positions``. Positions of -1
+    (unpaired rows) yield 0 and must be masked by the caller. Safe for empty
+    arrays and for nullable Int64 columns; the referenced positions must not
+    be null.
+    """
+    positions = np.asarray(positions)
+    out = np.zeros(len(positions), dtype=np.int64)
+    valid = positions >= 0
+    if valid.any():
+        out[valid] = np.asarray(values[positions[valid]], dtype=np.int64)
+    return out
+
+
 def _overlap_intidxs(df1, df2, how="left", cols1=None, cols2=None, on=None):
     """
     Find pairs of overlapping genomic intervals and return the integer
@@ -474,8 +515,12 @@ def overlap(
     index_col = return_index if isinstance(return_index, str) else "index"
     index_col_1 = index_col + suffixes[0]
     index_col_2 = index_col + suffixes[1]
-    df_index_1 = pd.DataFrame({index_col_1: df1.index[events1]}, dtype=pd.Int64Dtype())
-    df_index_2 = pd.DataFrame({index_col_2: df2.index[events2]}, dtype=pd.Int64Dtype())
+    df_index_1 = pd.DataFrame(
+        {index_col_1: _take_index_labels(df1.index, events1)}, dtype=pd.Int64Dtype()
+    )
+    df_index_2 = pd.DataFrame(
+        {index_col_2: _take_index_labels(df2.index, events2)}, dtype=pd.Int64Dtype()
+    )
 
     df_overlap = None
     if return_overlap:
@@ -483,15 +528,20 @@ def overlap(
         overlap_col_sk1 = overlap_col + "_" + sk1
         overlap_col_ek1 = overlap_col + "_" + ek1
 
-        overlap_start = np.maximum(
-            df1[sk1].values[events1],
-            df2[sk2].values[events2],
-        )
+        if len(df1) == 0 or len(df2) == 0:
+            # All pairs are unpaired; overlap coordinates are all missing.
+            overlap_start = pd.array([pd.NA] * len(events1), dtype=pd.Int64Dtype())
+            overlap_end = pd.array([pd.NA] * len(events1), dtype=pd.Int64Dtype())
+        else:
+            overlap_start = np.maximum(
+                df1[sk1].values[events1],
+                df2[sk2].values[events2],
+            )
 
-        overlap_end = np.minimum(
-            df1[ek1].values[events1],
-            df2[ek2].values[events2],
-        )
+            overlap_end = np.minimum(
+                df1[ek1].values[events1],
+                df2[ek2].values[events2],
+            )
 
         df_overlap = pd.DataFrame(
             {overlap_col_sk1: overlap_start, overlap_col_ek1: overlap_end}
@@ -500,11 +550,11 @@ def overlap(
     df_input_1 = None
     df_input_2 = None
     if return_input:
-        df_input_1 = df1.iloc[events1].reset_index(drop=True)
+        df_input_1 = _take_rows(df1, events1).reset_index(drop=True)
         df_input_1.columns = [c + suffixes[0] for c in df_input_1.columns]
 
     if return_input:
-        df_input_2 = df2.iloc[events2].reset_index(drop=True)
+        df_input_2 = _take_rows(df2, events2).reset_index(drop=True)
         df_input_2.columns = [c + suffixes[1] for c in df_input_2.columns]
 
     # Masking non-overlapping regions if using non-inner joins.
@@ -883,7 +933,7 @@ def coverage(
     _ck1, sk1, ek1 = _get_default_colnames() if cols1 is None else cols1
     _ck2, _sk2, _ek2 = _get_default_colnames() if cols2 is None else cols2
 
-    df1.reset_index(inplace=True, drop=True)
+    df1 = df1.reset_index(drop=True)
 
     df2_merged = merge(df2, cols=cols2)
 
@@ -1112,6 +1162,11 @@ def closest(
 
     return_distance : bool
         If True, return distances. Returns zero for overlaps.
+        Distances are exact integers: the ``distance`` column has dtype
+        ``Int64`` when every distance fits into signed int64, and ``UInt64``
+        otherwise (a distance can exceed int64 only when the paired intervals
+        span nearly the whole int64 range; every such distance fits uint64).
+        Distances are never truncated, saturated, or rounded to float.
 
     return_overlap : bool
         If True, return columns: 'have_overlap', 'overlap_start', and
@@ -1181,13 +1236,30 @@ def closest(
     if return_index:
         colname = return_index if isinstance(return_index, str) else "index"
         df_index1 = pd.DataFrame({colname + suffixes[0]: df1.index[events1]})
-        df_index2 = pd.DataFrame({colname + suffixes[1]: df2.index[events2]})
+        # Use a nullable integer dtype so that missing matches become NA
+        # without casting the matched labels to float64 and corrupting them.
+        df_index2 = pd.DataFrame(
+            {
+                colname + suffixes[1]: pd.array(
+                    _take_index_labels(df2.index, events2),
+                    dtype=_to_nullable_dtype(df2.index.dtype),
+                )
+            }
+        )
         df_index2[na_mask] = pd.NA
+
+    # Exact int64 coordinates of the paired intervals; positions with no
+    # match hold placeholders and are masked below.
+    if return_overlap or return_distance:
+        starts1 = _take_coords_int64(df1[sk1].values, events1)
+        ends1 = _take_coords_int64(df1[ek1].values, events1)
+        starts2 = _take_coords_int64(df2[sk2].values, events2)
+        ends2 = _take_coords_int64(df2[ek2].values, events2)
 
     df_overlap = None
     if return_overlap:
-        overlap_start = np.maximum(df1[sk1].values[events1], df2[sk2].values[events2])
-        overlap_end = np.minimum(df1[ek1].values[events1], df2[ek2].values[events2])
+        overlap_start = np.maximum(starts1, starts2)
+        overlap_end = np.minimum(ends1, ends2)
         have_overlap = overlap_start < overlap_end
         df_overlap = pd.DataFrame(
             {
@@ -1206,20 +1278,27 @@ def closest(
 
     df_distance = None
     if return_distance:
-        distance_left = np.maximum(
-            0,
-            df1[sk1].values[events1] - df2[ek2].values[events2],
+        # Distances are computed exactly with modular uint64 arithmetic:
+        # max(0, a - b) equals (a - b) mod 2**64 whenever a >= b. The
+        # distance column is Int64 when every distance fits int64 and UInt64
+        # otherwise (any distance between valid int64 intervals fits uint64).
+        distance_left = np.where(
+            starts1 >= ends2,
+            starts1.astype(np.uint64) - ends2.astype(np.uint64),
+            np.uint64(0),
         )
-        distance_right = np.maximum(
-            0,
-            df2[sk2].values[events2] - df1[ek1].values[events1],
+        distance_right = np.where(
+            starts2 >= ends1,
+            starts2.astype(np.uint64) - ends1.astype(np.uint64),
+            np.uint64(0),
         )
-        df_distance = pd.DataFrame(
-            {
-                "distance": np.maximum(distance_left, distance_right),
-            },
-            dtype=pd.Int64Dtype(),
-        )
+        distance = np.maximum(distance_left, distance_right)
+        if (~na_mask).any() and distance[~na_mask].max() > np.iinfo(np.int64).max:
+            df_distance = pd.DataFrame({"distance": distance}, dtype=pd.UInt64Dtype())
+        else:
+            df_distance = pd.DataFrame(
+                {"distance": distance.astype(np.int64)}, dtype=pd.Int64Dtype()
+            )
         df_distance[na_mask] = pd.NA
 
     df_input1 = None
@@ -1227,7 +1306,7 @@ def closest(
     if return_input:
         df_input1 = df1.iloc[events1].reset_index(drop=True)
         df_input1.columns = [col + suffixes[0] for col in df_input1.columns]
-        df_input2 = df2.iloc[events2].reset_index(drop=True)
+        df_input2 = _take_rows(df2, events2).reset_index(drop=True)
         df_input2.columns = [col + suffixes[1] for col in df_input2.columns]
         df_input2 = df_input2.astype(
             {sk2 + suffixes[1]: pd.Int64Dtype(), ek2 + suffixes[1]: pd.Int64Dtype()}
@@ -1411,7 +1490,7 @@ def count_overlaps(
 
     """
 
-    df1.reset_index(inplace=True, drop=True)
+    df1 = df1.reset_index(drop=True)
 
     df_counts = overlap(
         df1,

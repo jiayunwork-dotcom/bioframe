@@ -1,3 +1,4 @@
+import math
 import re
 import warnings
 
@@ -5,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 INT64_MAX = np.iinfo(np.int64).max
+INT64_MIN = np.iinfo(np.int64).min
 
 
 def natsort_key(s, _NS_REGEX=re.compile(r"(\d+)", re.U)):
@@ -177,10 +179,32 @@ def _size_overlap(starts1, ends1, starts2, ends2):
         An array where the i-th element contains the length of an overlap between
         the i-th interval in set 1 and the i-th interval in set 2.
         0 if the intervals overlap by a single point, -1 if they do not overlap.
+
+    Notes
+    -----
+    Overlap sizes are computed exactly. If every size fits into int64 the
+    result has dtype int64; otherwise the result is an object array of
+    Python ints (an overlap size can exceed int64 only when the intervals
+    jointly span nearly the whole int64 range).
     """
 
-    overlap_size = np.minimum(ends1, ends2) - np.maximum(starts1, starts2)
-    overlap_size[overlap_size < 0] = -1
+    lo = np.maximum(starts1, starts2)
+    hi = np.minimum(ends1, ends2)
+    has_overlap = hi >= lo
+    # Exact gap: modular uint64 arithmetic is exact because hi >= lo and the
+    # mathematical difference lies in [0, 2**64).
+    size = np.where(
+        has_overlap,
+        np.asarray(hi, dtype=np.int64).astype(np.uint64)
+        - np.asarray(lo, dtype=np.int64).astype(np.uint64),
+        np.uint64(0),
+    )
+    if size.size == 0 or size.max() <= INT64_MAX:
+        overlap_size = size.astype(np.int64)
+        overlap_size[~has_overlap] = -1
+        return overlap_size
+    overlap_size = size.astype(object)
+    overlap_size[~has_overlap] = -1
     return overlap_size
 
 
@@ -287,6 +311,17 @@ def _convert_points_to_len1_segments(starts, ends):
     return [starts, pseudo_ends]
 
 
+def _points_require_wide_dtype(starts, ends):
+    """
+    Check if shifting point intervals [p, p) to [p, p+1) would overflow the
+    dtype of `ends`, i.e. if any point sits at the dtype maximum. Object
+    arrays already use exact Python integer arithmetic and never overflow.
+    """
+    if not np.issubdtype(ends.dtype, np.integer):
+        return False
+    return bool(((starts == ends) & (ends == np.iinfo(ends.dtype).max)).any())
+
+
 def overlap_intervals(starts1, ends1, starts2, ends2, closed=False, sort=False):
     """
     Take two sets of intervals and return the indices of pairs of overlapping intervals.
@@ -316,10 +351,21 @@ def overlap_intervals(starts1, ends1, starts2, ends2, closed=False, sort=False):
 
     starts1 = np.asarray(starts1)
     ends1 = np.asarray(ends1)
-    starts1, ends1 = _convert_points_to_len1_segments(starts1, ends1)
-
     starts2 = np.asarray(starts2)
     ends2 = np.asarray(ends2)
+
+    # Points at the dtype maximum cannot be shifted by +1 in fixed-width
+    # arithmetic; switch to exact Python integer (object) arithmetic for
+    # those rare inputs. This keeps the common path at full int64 speed.
+    if _points_require_wide_dtype(starts1, ends1) or _points_require_wide_dtype(
+        starts2, ends2
+    ):
+        starts1 = starts1.astype(object)
+        ends1 = ends1.astype(object)
+        starts2 = starts2.astype(object)
+        ends2 = ends2.astype(object)
+
+    starts1, ends1 = _convert_points_to_len1_segments(starts1, ends1)
     starts2, ends2 = _convert_points_to_len1_segments(starts2, ends2)
 
     # Concatenate intervals lists
@@ -412,6 +458,40 @@ def overlap_intervals_outer(starts1, ends1, starts2, ends2, closed=False):
     return ovids1, ovids2, no_overlap_ids1, no_overlap_ids2
 
 
+def _exceeds_min_dist(next_starts, prev_ends, min_dist):
+    """
+    Return ``next_starts > prev_ends + min_dist``, computed exactly.
+
+    Interval gaps are integral, so ``gap > min_dist`` is equivalent to
+    ``gap > floor(min_dist)``; comparing against the integer threshold also
+    avoids floating-point rounding of large coordinates. The vectorized
+    int64 path is used only when ``prev_ends + floor(min_dist)`` cannot
+    overflow; otherwise the comparison is evaluated exactly with Python
+    integers (object arrays), at the cost of an O(n) element-wise pass.
+    Non-finite ``min_dist`` keeps the legacy behavior: NaN and +inf merge
+    everything, -inf merges nothing.
+    """
+    if isinstance(min_dist, (int, np.integer)):
+        md = int(min_dist)  # exact, avoids rounding through float
+    else:
+        min_dist_f = float(min_dist)
+        if math.isnan(min_dist_f):
+            return np.zeros(next_starts.shape, dtype=bool)
+        if math.isinf(min_dist_f):
+            return np.full(next_starts.shape, min_dist_f < 0, dtype=bool)
+        md = math.floor(min_dist_f)
+
+    if next_starts.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    lo = int(prev_ends.min()) + md
+    hi = int(prev_ends.max()) + md
+    if INT64_MIN <= lo and hi <= INT64_MAX:
+        return next_starts > prev_ends + md
+    # Exact path for coordinates/thresholds that would overflow int64.
+    return next_starts.astype(object) > (prev_ends.astype(object) + md)
+
+
 def merge_intervals(starts, ends, min_dist=0):
     """
     Merge overlapping intervals.
@@ -465,7 +545,7 @@ def merge_intervals(starts, ends, min_dist=0):
     cluster_borders[-1] = True
 
     if min_dist is not None:
-        cluster_borders[1:-1] = starts[1:] > ends[:-1] + min_dist
+        cluster_borders[1:-1] = _exceeds_min_dist(starts[1:], ends[:-1], min_dist)
     else:
         cluster_borders[1:-1] = starts[1:] >= ends[:-1]
 
@@ -558,12 +638,17 @@ def _closest_intervals_nooverlap(
     ids2 = np.array([], dtype=int)
 
     if k > 0 and direction == "left":
+        # The k nearest left candidates are taken from the end of the sorted
+        # order; the extra keys make the selection deterministic and prefer
+        # lower tie values and then lower set-2 positions among equidistant
+        # candidates, matching the final tie-breaking in closest_intervals.
+        positions = np.arange(0, n2)
         if tie_arr is None:
-            ends2_sort_order = np.argsort(ends2)
+            ends2_sort_order = np.lexsort([-positions, ends2])
         else:
-            ends2_sort_order = np.lexsort([-tie_arr, ends2])
+            ends2_sort_order = np.lexsort([-positions, -tie_arr, ends2])
 
-        ids2_endsorted = np.arange(0, n2)[ends2_sort_order]
+        ids2_endsorted = positions[ends2_sort_order]
         ends2_sorted = ends2[ends2_sort_order]
 
         left_closest_endidx = np.searchsorted(ends2_sorted, starts1, "right")
@@ -576,12 +661,16 @@ def _closest_intervals_nooverlap(
         ids2 = ids2_endsorted[int2_sorted_ids]
 
     elif k > 0 and direction == "right":
+        # The k nearest right candidates are taken from the beginning of the
+        # sorted order; the extra keys prefer lower tie values and then lower
+        # set-2 positions among equidistant candidates.
+        positions = np.arange(0, n2)
         if tie_arr is None:
-            starts2_sort_order = np.argsort(starts2)
+            starts2_sort_order = np.lexsort([positions, starts2])
         else:
-            starts2_sort_order = np.lexsort([tie_arr, starts2])
+            starts2_sort_order = np.lexsort([positions, tie_arr, starts2])
 
-        ids2_startsorted = np.arange(0, n2)[starts2_sort_order]
+        ids2_startsorted = positions[starts2_sort_order]
         starts2_sorted = starts2[starts2_sort_order]
 
         right_closest_startidx = np.searchsorted(starts2_sorted, ends1, "left")
@@ -596,6 +685,18 @@ def _closest_intervals_nooverlap(
         ids2 = ids2_startsorted[int2_sorted_ids]
 
     return ids1, ids2
+
+
+def _uint64_gap(larger, smaller):
+    """
+    Exact difference ``larger - smaller`` of int64-representable coordinate
+    arrays with ``larger >= smaller`` elementwise, returned as uint64.
+    Modular arithmetic is exact here because the mathematical result lies
+    in [0, 2**64); this never overflows, unlike int64 subtraction.
+    """
+    larger = np.asarray(larger, dtype=np.int64).astype(np.uint64)
+    smaller = np.asarray(smaller, dtype=np.int64).astype(np.uint64)
+    return larger - smaller
 
 
 def closest_intervals(
@@ -719,25 +820,41 @@ def closest_intervals(
     right_ids1 = np.concatenate([neg_up1, pos_dn1])
     right_ids2 = np.concatenate([neg_up2, pos_dn2])
 
-    # Increase the distance by 1 to distinguish between overlapping
-    # and non-overlapping set 2 intervals.
-    left_dists = starts1[left_ids1] - ends2[left_ids2] + 1
-    right_dists = starts2[right_ids2] - ends1[right_ids1] + 1
-
-    # Combine the results
+    # Combine the results. Overlapping pairs are marked so that they sort
+    # before any non-overlapping pair; among non-overlapping pairs, exact
+    # integer gaps (uint64, see _uint64_gap) decide the order. This replaces
+    # the former int64 distance+1 encoding, which could overflow for
+    # coordinates spanning the full int64 range and was contaminated by
+    # float64 zeros for the overlapping pairs.
     events1 = np.concatenate([left_ids1, right_ids1, ovids1])
     events2 = np.concatenate([left_ids2, right_ids2, ovids2])
-    dists = np.concatenate([left_dists, right_dists, np.zeros(ovids1.shape[0])])
+    is_not_overlap = np.concatenate(
+        [
+            np.ones(len(left_ids1), dtype=bool),
+            np.ones(len(right_ids1), dtype=bool),
+            np.zeros(ovids1.shape[0], dtype=bool),
+        ]
+    )
+    gaps = np.concatenate(
+        [
+            _uint64_gap(starts1[left_ids1], ends2[left_ids2]),
+            _uint64_gap(starts2[right_ids2], ends1[right_ids1]),
+            np.zeros(ovids1.shape[0], dtype=np.uint64),
+        ]
+    )
 
     if len(events1) == 0:
         return np.array([], dtype=int), np.array([], dtype=int)
 
-    # Sort by distance to set 1 intervals and, if present, by the tie-breaking
-    # data array.
+    # Sort by overlap status and gap to set 1 intervals and, if present, by
+    # the tie-breaking data array. The tie-breaking values must be aligned
+    # with the candidate pairs via events2.
     if tie_arr is None:
-        order = np.lexsort([events2, dists, events1])
+        order = np.lexsort([events2, gaps, is_not_overlap, events1])
     else:
-        order = np.lexsort([events2, tie_arr, dists, events1])
+        order = np.lexsort(
+            [events2, np.asarray(tie_arr)[events2], gaps, is_not_overlap, events1]
+        )
     events1 = events1[order]
     events2 = events2[order]
 

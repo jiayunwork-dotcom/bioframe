@@ -76,11 +76,12 @@ def is_bedframe(
             )
         return False
 
-    if ((df[ek1] - df[sk1]) < 0).any():
+    invalid_order = df[ek1] < df[sk1]
+    if invalid_order.any():
         if raise_errors:
             raise ValueError(
                 f"Invalid bedframe: starts exceed ends for "
-                f"{sum((df[ek1] - df[sk1]) < 0)} intervals"
+                f"{invalid_order.sum()} intervals"
             )
         return False
 
@@ -145,6 +146,32 @@ def is_cataloged(
     return True
 
 
+def _sum_of_lengths(starts, ends):
+    """
+    Exact sum of interval lengths ``end - start`` as a Python int.
+
+    Null (start, end) pairs are skipped. The vectorized int64 path is used
+    only when neither the individual lengths nor their sum can overflow;
+    otherwise the sum is accumulated with Python integers.
+    """
+    starts_np = np.asarray(starts)
+    ends_np = np.asarray(ends)
+    if starts_np.dtype == np.int64 and ends_np.dtype == np.int64:
+        n = starts_np.shape[0]
+        if n == 0:
+            return 0
+        span = int(ends_np.max()) - int(starts_np.min())
+        if 0 <= span <= np.iinfo(np.int64).max // n:
+            # Every length fits int64 and their sum cannot overflow either.
+            return int(np.sum(ends_np - starts_np))
+    total = 0
+    for s, e in zip(starts_np, ends_np):
+        if pd.isna(s) or pd.isna(e):
+            continue
+        total += int(e) - int(s)
+    return total
+
+
 def is_overlapping(df, cols=None):
     """
     Tests if any genomic intervals in a bioframe `df` overlap.
@@ -171,8 +198,10 @@ def is_overlapping(df, cols=None):
 
     df_merged = merge(df, cols=cols)
 
-    total_interval_len = np.sum((df[ek1] - df[sk1]).values)
-    total_interval_len_merged = np.sum((df_merged[ek1] - df_merged[sk1]).values)
+    total_interval_len = _sum_of_lengths(df[sk1].values, df[ek1].values)
+    total_interval_len_merged = _sum_of_lengths(
+        df_merged[sk1].values, df_merged[ek1].values
+    )
 
     if total_interval_len > total_interval_len_merged:
         return True
